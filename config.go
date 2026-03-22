@@ -3,11 +3,11 @@ package main
 import "time"
 
 const (
-	MyInterfaceIP = "192.168.29.165"
+	MyInterfaceIP = "192.168.146.208"
 	MdnsAddr      = "224.0.0.251"
 	MdnsAddrStr   = "224.0.0.251:5353"
-	ProbeTimeout  = 12 * time.Second
-	WorkerCount   = 256
+	ProbeTimeout  = 20 * time.Second // one global window, 5s is plenty for mDNS
+	QueryPacing   = 1 * time.Millisecond
 )
 
 var BaseServiceTypes = []string{

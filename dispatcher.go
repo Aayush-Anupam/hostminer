@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"strings"
-	"sync"
 	"syscall"
 
 	"github.com/miekg/dns"
@@ -13,19 +13,21 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// resultEntry holds the channel a worker listens on for its current IP.
-type resultEntry struct {
-	ch chan string
+// HostResult is a single ip→hostname pair received from the network.
+type HostResult struct {
+	IP       string
+	Hostname string
 }
 
-// Dispatcher owns the single shared UDP socket and routes incoming
-// mDNS responses to whichever worker is probing that IP.
+// Dispatcher owns the single shared UDP socket. It pours all
+// incoming mDNS responses into two channels — one for ip→hostname
+// results, one for DNS-SD service hints. No per-IP routing,
+// no resultMap, no locks.
 type Dispatcher struct {
 	conn          *net.UDPConn
 	dest          *net.UDPAddr
-	mu            sync.RWMutex
-	resultMap     map[string]*resultEntry
-	globalDnsSdCh chan string // DNS-SD hints, consumed by RunQuerySender
+	resultCh      chan HostResult
+	globalDnsSdCh chan string
 }
 
 func NewDispatcher(iface *net.Interface) (*Dispatcher, error) {
@@ -46,24 +48,26 @@ func NewDispatcher(iface *net.Interface) (*Dispatcher, error) {
 		},
 	}
 
-	pc, err := lc.ListenPacket(context.Background(), "udp4", "0.0.0.0:5353")
+	pc, err := lc.ListenPacket(context.Background(), "udp4", "192.168.146.208:5353")
 	if err != nil {
 		return nil, fmt.Errorf("bind 0.0.0.0:5353: %w", err)
 	}
 	conn := pc.(*net.UDPConn)
+	log.Printf("UDP socket bound to 0.0.0.0:5353")
 
 	p := ipv4.NewPacketConn(conn)
 	if err := p.JoinGroup(iface, &net.UDPAddr{IP: net.ParseIP(MdnsAddr)}); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("JoinGroup: %w", err)
+		return nil, fmt.Errorf("JoinGroup on interface %s (index %d): %w — check that the interface is up and supports multicast", iface.Name, iface.Index, err)
 	}
+	log.Printf("Joined multicast group %s on interface %s", MdnsAddr, iface.Name)
 
 	dest, _ := net.ResolveUDPAddr("udp4", MdnsAddrStr)
 
 	d := &Dispatcher{
 		conn:          conn,
 		dest:          dest,
-		resultMap:     make(map[string]*resultEntry),
+		resultCh:      make(chan HostResult, 1024),
 		globalDnsSdCh: make(chan string, 256),
 	}
 	go d.readLoop()
@@ -72,11 +76,14 @@ func NewDispatcher(iface *net.Interface) (*Dispatcher, error) {
 
 func (d *Dispatcher) readLoop() {
 	buf := make([]byte, 65536)
+	log.Printf("readLoop started — listening for mDNS responses")
 	for {
-		n, _, err := d.conn.ReadFromUDP(buf)
+		n, src, err := d.conn.ReadFromUDP(buf)
 		if err != nil {
+			log.Printf("readLoop: socket read error (socket closed?): %v", err)
 			return
 		}
+		_ = src // available for debug: log.Printf("packet from %s", src)
 
 		var msg dns.Msg
 		if err := msg.Unpack(buf[:n]); err != nil {
@@ -88,7 +95,7 @@ func (d *Dispatcher) readLoop() {
 
 		all := append(msg.Answer, msg.Extra...)
 
-		// Forward any DNS-SD service hints to the global sender.
+		// Forward DNS-SD service hints.
 		for _, svc := range extractDNSSDServices(all) {
 			select {
 			case d.globalDnsSdCh <- svc:
@@ -96,40 +103,16 @@ func (d *Dispatcher) readLoop() {
 			}
 		}
 
-		// Extract ip→hostname matches and deliver to the specific
-		// worker waiting for that IP. One send, not a broadcast.
-		matches := extractAllMatches(all)
-		if len(matches) == 0 {
-			continue
-		}
-
-		d.mu.RLock()
-		for ip, hostname := range matches {
-			if entry, ok := d.resultMap[ip]; ok {
-				select {
-				case entry.ch <- hostname:
-				default:
-				}
+		// Pour all ip→hostname pairs into the single result channel.
+		// No routing, no map lookup, no locks.
+		for ip, hostname := range extractAllMatches(all) {
+			select {
+			case d.resultCh <- HostResult{IP: ip, Hostname: hostname}:
+			default:
+				// collector is not keeping up — drop rather than block readLoop
 			}
 		}
-		d.mu.RUnlock()
 	}
-}
-
-func (d *Dispatcher) register(ip string) *resultEntry {
-	entry := &resultEntry{
-		ch: make(chan string, 8),
-	}
-	d.mu.Lock()
-	d.resultMap[ip] = entry
-	d.mu.Unlock()
-	return entry
-}
-
-func (d *Dispatcher) unregister(ip string) {
-	d.mu.Lock()
-	delete(d.resultMap, ip)
-	d.mu.Unlock()
 }
 
 func (d *Dispatcher) Send(name string, qtype uint16) {
@@ -141,9 +124,12 @@ func (d *Dispatcher) Send(name string, qtype uint16) {
 	}
 	buf, err := m.Pack()
 	if err != nil {
+		log.Printf("Send: failed to pack DNS query for %s: %v", name, err)
 		return
 	}
-	d.conn.WriteToUDP(buf, d.dest)
+	if _, err := d.conn.WriteToUDP(buf, d.dest); err != nil {
+		log.Printf("Send: failed to write UDP packet for %s: %v", name, err)
+	}
 }
 
 // extractAllMatches scans a DNS record set and returns every

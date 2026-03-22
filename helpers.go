@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"strings"
 )
@@ -32,12 +33,23 @@ func arpaToIP(arpaName string) string {
 // given IP address assigned to it.
 func findInterfaceByIP(ipStr string) (*net.Interface, error) {
 	target := net.ParseIP(ipStr)
+	if target == nil {
+		return nil, fmt.Errorf("invalid IP address: %q", ipStr)
+	}
+
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("listing network interfaces: %w", err)
 	}
+
+	// Collect all interface→IP pairs for the error message.
+	var available []string
 	for _, iface := range ifaces {
-		addrs, _ := iface.Addrs()
+		addrs, addrErr := iface.Addrs()
+		if addrErr != nil {
+			log.Printf("warning: cannot read addresses for interface %s: %v", iface.Name, addrErr)
+			continue
+		}
 		for _, addr := range addrs {
 			var ip net.IP
 			switch v := addr.(type) {
@@ -46,12 +58,19 @@ func findInterfaceByIP(ipStr string) (*net.Interface, error) {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			if ip != nil && ip.Equal(target) {
+			if ip == nil {
+				continue
+			}
+			available = append(available, fmt.Sprintf("%s(%s)", iface.Name, ip))
+			if ip.Equal(target) {
 				return &iface, nil
 			}
 		}
 	}
-	return nil, fmt.Errorf("no interface with IP %s", ipStr)
+	return nil, fmt.Errorf(
+		"no interface with IP %s\navailable interfaces: %s",
+		ipStr, strings.Join(available, ", "),
+	)
 }
 
 // hostsFromCIDR expands a CIDR block into individual host IPs,
