@@ -1,4 +1,4 @@
-package main
+package mdns
 
 import (
 	"context"
@@ -6,11 +6,10 @@ import (
 	"log"
 	"net"
 	"strings"
-	"syscall"
+	"sync"
 
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
-	"golang.org/x/sys/windows"
 )
 
 // HostResult is a single ip→hostname pair received from the network.
@@ -28,32 +27,26 @@ type Dispatcher struct {
 	dest          *net.UDPAddr
 	resultCh      chan HostResult
 	globalDnsSdCh chan string
+	done          chan struct{}
+	closeOnce     sync.Once
 }
 
-func NewDispatcher(iface *net.Interface) (*Dispatcher, error) {
+// NewDispatcher creates a UDP socket bound to bindIP:5353 on the given
+// interface. Binding to the interface's own IP (rather than 0.0.0.0) ensures
+// that outgoing multicast queries and incoming multicast responses are all
+// routed through the intended interface.
+func NewDispatcher(iface *net.Interface, bindIP net.IP) (*Dispatcher, error) {
 	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			var optErr error
-			if err := c.Control(func(fd uintptr) {
-				optErr = windows.SetsockoptInt(
-					windows.Handle(fd),
-					windows.SOL_SOCKET,
-					windows.SO_REUSEADDR,
-					1,
-				)
-			}); err != nil {
-				return err
-			}
-			return optErr
-		},
+		Control: controlSocket,
 	}
 
-	pc, err := lc.ListenPacket(context.Background(), "udp4", "192.168.146.208:5353")
+	bindAddr := fmt.Sprintf("%s:5353", bindIP.String())
+	pc, err := lc.ListenPacket(context.Background(), "udp4", bindAddr)
 	if err != nil {
-		return nil, fmt.Errorf("bind 0.0.0.0:5353: %w", err)
+		return nil, fmt.Errorf("bind %s: %w", bindAddr, err)
 	}
 	conn := pc.(*net.UDPConn)
-	log.Printf("UDP socket bound to 0.0.0.0:5353")
+	log.Printf("UDP socket bound to %s", bindAddr)
 
 	p := ipv4.NewPacketConn(conn)
 	if err := p.JoinGroup(iface, &net.UDPAddr{IP: net.ParseIP(MdnsAddr)}); err != nil {
@@ -69,9 +62,18 @@ func NewDispatcher(iface *net.Interface) (*Dispatcher, error) {
 		dest:          dest,
 		resultCh:      make(chan HostResult, 1024),
 		globalDnsSdCh: make(chan string, 256),
+		done:          make(chan struct{}),
 	}
 	go d.readLoop()
 	return d, nil
+}
+
+// Close shuts down the dispatcher. It is safe to call multiple times.
+func (d *Dispatcher) Close() {
+	d.closeOnce.Do(func() {
+		close(d.done)
+		d.conn.Close()
+	})
 }
 
 func (d *Dispatcher) readLoop() {
@@ -80,7 +82,12 @@ func (d *Dispatcher) readLoop() {
 	for {
 		n, src, err := d.conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("readLoop: socket read error (socket closed?): %v", err)
+			select {
+			case <-d.done:
+				// Clean shutdown — Close() was called; suppress the noisy error.
+			default:
+				log.Printf("readLoop: unexpected socket read error: %v", err)
+			}
 			return
 		}
 		_ = src // available for debug: log.Printf("packet from %s", src)
