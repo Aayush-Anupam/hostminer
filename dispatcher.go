@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
@@ -20,8 +21,7 @@ type HostResult struct {
 
 // Dispatcher owns the single shared UDP socket. It pours all
 // incoming mDNS responses into two channels — one for ip→hostname
-// results, one for DNS-SD service hints. No per-IP routing,
-// no resultMap, no locks.
+// results, one for DNS-SD service hints.
 type Dispatcher struct {
 	conn          *net.UDPConn
 	dest          *net.UDPAddr
@@ -29,12 +29,11 @@ type Dispatcher struct {
 	globalDnsSdCh chan string
 	done          chan struct{}
 	closeOnce     sync.Once
+	dropped       atomic.Int64
 }
 
 // NewDispatcher creates a UDP socket bound to bindIP:5353 on the given
-// interface. Binding to the interface's own IP (rather than 0.0.0.0) ensures
-// that outgoing multicast queries and incoming multicast responses are all
-// routed through the intended interface.
+// interface.
 func NewDispatcher(iface *net.Interface, bindIP net.IP) (*Dispatcher, error) {
 	lc := net.ListenConfig{
 		Control: controlSocket,
@@ -60,7 +59,7 @@ func NewDispatcher(iface *net.Interface, bindIP net.IP) (*Dispatcher, error) {
 	d := &Dispatcher{
 		conn:          conn,
 		dest:          dest,
-		resultCh:      make(chan HostResult, 1024),
+		resultCh:      make(chan HostResult, resultChBuffer),
 		globalDnsSdCh: make(chan string, 256),
 		done:          make(chan struct{}),
 	}
@@ -68,11 +67,14 @@ func NewDispatcher(iface *net.Interface, bindIP net.IP) (*Dispatcher, error) {
 	return d, nil
 }
 
-// Close shuts down the dispatcher. It is safe to call multiple times.
+// Close shuts down the dispatcher. Safe to call multiple times.
 func (d *Dispatcher) Close() {
 	d.closeOnce.Do(func() {
 		close(d.done)
 		d.conn.Close()
+		if n := d.dropped.Load(); n > 0 {
+			log.Printf("WARNING: dropped %d results due to full resultCh — consider increasing resultChBuffer", n)
+		}
 	})
 }
 
@@ -84,13 +86,13 @@ func (d *Dispatcher) readLoop() {
 		if err != nil {
 			select {
 			case <-d.done:
-				// Clean shutdown — Close() was called; suppress the noisy error.
+				// clean shutdown
 			default:
 				log.Printf("readLoop: unexpected socket read error: %v", err)
 			}
 			return
 		}
-		_ = src // available for debug: log.Printf("packet from %s", src)
+		_ = src
 
 		var msg dns.Msg
 		if err := msg.Unpack(buf[:n]); err != nil {
@@ -102,7 +104,6 @@ func (d *Dispatcher) readLoop() {
 
 		all := append(msg.Answer, msg.Extra...)
 
-		// Forward DNS-SD service hints.
 		for _, svc := range extractDNSSDServices(all) {
 			select {
 			case d.globalDnsSdCh <- svc:
@@ -110,18 +111,17 @@ func (d *Dispatcher) readLoop() {
 			}
 		}
 
-		// Pour all ip→hostname pairs into the single result channel.
-		// No routing, no map lookup, no locks.
 		for ip, hostname := range extractAllMatches(all) {
 			select {
 			case d.resultCh <- HostResult{IP: ip, Hostname: hostname}:
 			default:
-				// collector is not keeping up — drop rather than block readLoop
+				d.dropped.Add(1)
 			}
 		}
 	}
 }
 
+// Send packs and transmits a single mDNS query onto the multicast group.
 func (d *Dispatcher) Send(name string, qtype uint16) {
 	m := new(dns.Msg)
 	m.Id = 0
@@ -139,20 +139,23 @@ func (d *Dispatcher) Send(name string, qtype uint16) {
 	}
 }
 
-// extractAllMatches scans a DNS record set and returns every
-// ip→hostname pair it can determine.
+// extractAllMatches scans a DNS record set and returns every ip→hostname pair.
 func extractAllMatches(records []dns.RR) map[string]string {
 	result := make(map[string]string)
 
-	// Index A records: lowercase hostname → ip
-	aRecords := make(map[string]string)
+	// Index A records: lowercase key → IP string, and preserve original casing.
+	aRecords := make(map[string]string)     // lowercase name → IP
+	aRecordNames := make(map[string]string) // lowercase name → original-case name
+
 	for _, rr := range records {
 		if r, ok := rr.(*dns.A); ok {
-			aRecords[strings.ToLower(r.Hdr.Name)] = r.A.String()
+			lower := strings.ToLower(r.Hdr.Name)
+			aRecords[lower] = r.A.String()
+			aRecordNames[lower] = r.Hdr.Name
 		}
 	}
 
-	// Pass 1: reverse PTR — ip is encoded in the arpa name itself
+	// Pass 1: reverse PTR — IP is encoded in the arpa name itself.
 	for _, rr := range records {
 		if r, ok := rr.(*dns.PTR); ok {
 			if strings.HasSuffix(r.Hdr.Name, ".in-addr.arpa.") {
@@ -164,20 +167,20 @@ func extractAllMatches(records []dns.RR) map[string]string {
 		}
 	}
 
-	// Pass 2: A record — ip is the record value
-	for name, ip := range aRecords {
+	// Pass 2: A record — IP is the record value, preserve original hostname casing.
+	for lower, ip := range aRecords {
 		if _, already := result[ip]; !already {
-			result[ip] = strings.TrimSuffix(name, ".")
+			result[ip] = strings.TrimSuffix(aRecordNames[lower], ".")
 		}
 	}
 
-	// Pass 3: SRV whose target has a matching A record in same message
+	// Pass 3: SRV whose target has a matching A record in the same message.
 	for _, rr := range records {
 		if r, ok := rr.(*dns.SRV); ok {
 			target := strings.ToLower(r.Target)
 			if ip, exists := aRecords[target]; exists {
 				if _, already := result[ip]; !already {
-					result[ip] = strings.TrimSuffix(r.Target, ".")
+					result[ip] = strings.TrimSuffix(aRecordNames[target], ".")
 				}
 			}
 		}
