@@ -1,12 +1,12 @@
-// Package mdns implements mDNS (Multicast DNS, RFC 6762) host discovery
-// and DNS-SD (DNS Service Discovery, RFC 6763) scanning.
+// Package hostminer discovers hostnames for every IP in a subnet by running
+// multiple resolution strategies (mDNS, NetBIOS, …) in parallel.
 //
-// Use [Probe] to scan a subnet for mDNS-enabled hosts:
+// Use [Probe] to scan a subnet:
 //
-//	results, err := mdns.Probe(ctx, mdns.Options{
+//	results, err := hostminer.Probe(ctx, hostminer.Options{
 //	    CIDR:      "192.168.1.0/24",
 //	    Interface: "192.168.1.5", // or empty for auto-detect
 //	})
 //
-// For the command-line tool, see cmd/mdnsprobe.
-package mdns
+// For the command-line tool, see cmd/hostminer.
+package hostminer
