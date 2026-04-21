@@ -1,6 +1,6 @@
 //go:build !windows
 
-package mdns
+package hostminer
 
 import "syscall"
 

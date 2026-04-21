@@ -1,37 +1,21 @@
-package mdns
+package hostminer
 
 import "time"
 
 const (
-	MdnsAddr     = "224.0.0.251"
-	MdnsAddrStr  = "224.0.0.251:5353"
+	// MdnsAddr is the IPv4 multicast address used by mDNS (RFC 6762).
+	MdnsAddr    = "224.0.0.251"
+	MdnsAddrStr = "224.0.0.251:5353"
+
+	// ProbeTimeout is the default scan duration when Options.Timeout is zero.
 	ProbeTimeout = 20 * time.Second
 
-	// PTR sender tuning
-	ptrWorkerCount = 20
-	ptrPacingFloor = 50 * time.Microsecond
-	ptrPacingCap   = 1 * time.Millisecond
-	ptrSendBudget  = 0.45 // fraction of timeout allocated to PTR sending phase
-
-	// DNS-SD query sender
-	dnsSDInterQueryDelay = 20 * time.Millisecond
-	dnsSDPhase2Fraction  = 0.25 // fraction of timeout for phase 2 re-query window
-
-	// Result collection
+	// resultChBuffer is the capacity of the shared result channel. Increase
+	// this if log warnings report dropped results on large subnets.
 	resultChBuffer = 4096
 )
 
-// Method identifies a hostname-resolution technique used during a probe.
-type Method string
-
-const (
-	MethodMDNS Method = "mdns"
-	// MethodNetBIOS Method = "netbios"
-	// MethodRDNS    Method = "rdns"
-)
-
-var DefaultMethods = []Method{MethodMDNS}
-
+// BaseServiceTypes are the DNS-SD service types queried during an mDNS scan.
 var BaseServiceTypes = []string{
 	"_services._dns-sd._udp.local.",
 	"_http._tcp.local.",
