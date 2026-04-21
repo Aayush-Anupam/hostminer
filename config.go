@@ -5,28 +5,31 @@ import "time"
 const (
 	MdnsAddr     = "224.0.0.251"
 	MdnsAddrStr  = "224.0.0.251:5353"
-	ProbeTimeout = 20 * time.Second // one global window, 5s is plenty for mDNS
-	QueryPacing  = 1 * time.Millisecond
+	ProbeTimeout = 20 * time.Second
+
+	// PTR sender tuning
+	ptrWorkerCount = 20
+	ptrPacingFloor = 50 * time.Microsecond
+	ptrPacingCap   = 1 * time.Millisecond
+	ptrSendBudget  = 0.45 // fraction of timeout allocated to PTR sending phase
+
+	// DNS-SD query sender
+	dnsSDInterQueryDelay = 20 * time.Millisecond
+	dnsSDPhase2Fraction  = 0.25 // fraction of timeout for phase 2 re-query window
+
+	// Result collection
+	resultChBuffer = 4096
 )
 
 // Method identifies a hostname-resolution technique used during a probe.
-// Additional methods (NetBIOS, reverse-DNS, etc.) can be added here and
-// dispatched inside Probe without changing the public API.
 type Method string
 
 const (
-	// MethodMDNS resolves hostnames via Multicast DNS (RFC 6762) and DNS-SD (RFC 6763).
 	MethodMDNS Method = "mdns"
-
-	// MethodNetBIOS resolves hostnames via NetBIOS Name Service (future).
 	// MethodNetBIOS Method = "netbios"
-
-	// MethodRDNS resolves hostnames via unicast reverse-DNS PTR queries (future).
-	// MethodRDNS Method = "rdns"
+	// MethodRDNS    Method = "rdns"
 )
 
-// DefaultMethods is the ordered list of resolution techniques used when the
-// caller does not specify Methods in Options.
 var DefaultMethods = []Method{MethodMDNS}
 
 var BaseServiceTypes = []string{

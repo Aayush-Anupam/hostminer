@@ -31,17 +31,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mdns "mdnsprobe"
 	"os"
 	"strings"
-	"time"
-
-	mdns "mdnsprobe"
 )
 
 func main() {
 	target := flag.String("target", "", "Target subnet in CIDR notation (required), e.g. 192.168.1.0/24")
 	iface := flag.String("interface", "", "Network interface: IP (192.168.1.5), name (eth0/Wi-Fi), or empty for auto-detect via CIDR matching")
-	timeout := flag.Duration("timeout", 20*time.Second, "How long to listen for mDNS responses")
+	timeout := flag.Duration("timeout", mdns.ProbeTimeout, "How long to listen for mDNS responses")
 	methods := flag.String("methods", "", "Comma-separated resolution methods to use (default: mdns). Supported: mdns")
 	verbose := flag.Bool("verbose", false, "Print verbose diagnostic log output to stderr")
 	flag.Parse()
