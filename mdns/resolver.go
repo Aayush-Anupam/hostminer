@@ -1,38 +1,30 @@
-package hostminer
+// Package mdns implements hostname resolution via mDNS/DNS-SD (RFC 6762/6763).
+package mdns
 
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/miekg/dns"
+
+	"hostminer/internal/logger"
+	"hostminer/internal/proto"
 )
 
-const (
-	ptrWorkerCount = 20
-
-	ptrSendBudget  = 0.45
-	ptrPacingFloor = 50 * time.Microsecond
-	ptrPacingCap   = 1 * time.Millisecond
-
-	dnsSDInterQueryDelay = 20 * time.Millisecond
-	dnsSDPhase2Fraction  = 0.25
-)
-
-// MDNSResolver implements [Resolver] using mDNS/DNS-SD (RFC 6762/6763).
-type MDNSResolver struct {
+// Resolver implements [proto.Resolver] using mDNS/DNS-SD.
+type Resolver struct {
 	iface       *net.Interface
 	bindIP      net.IP
 	timeout     time.Duration
 	targetCount int
 }
 
-// NewMDNSResolver creates an MDNSResolver for the given interface and bind IP.
-func NewMDNSResolver(iface *net.Interface, bindIP net.IP, timeout time.Duration, targetCount int) *MDNSResolver {
-	return &MDNSResolver{
+// NewResolver creates an mDNS Resolver for the given interface and bind IP.
+func NewResolver(iface *net.Interface, bindIP net.IP, timeout time.Duration, targetCount int) *Resolver {
+	return &Resolver{
 		iface:       iface,
 		bindIP:      bindIP,
 		timeout:     timeout,
@@ -40,9 +32,11 @@ func NewMDNSResolver(iface *net.Interface, bindIP net.IP, timeout time.Duration,
 	}
 }
 
-func (r *MDNSResolver) Name() string { return "mdns" }
+func (r *Resolver) Name() string { return string(proto.MethodMDNS) }
 
-func (r *MDNSResolver) Resolve(ctx context.Context, targets []string, results chan<- HostResult) error {
+// Resolve opens the multicast socket, fires PTR and DNS-SD queries, and
+// forwards every discovered ip→hostname pair to results until ctx is done.
+func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<- proto.HostResult) error {
 	d, err := NewDispatcher(r.iface, r.bindIP)
 	if err != nil {
 		return fmt.Errorf("mdns dispatcher: %w", err)
@@ -52,7 +46,7 @@ func (r *MDNSResolver) Resolve(ctx context.Context, targets []string, results ch
 	pacing := computePTRPacing(r.timeout, r.targetCount)
 	phase2 := time.Duration(float64(r.timeout) * dnsSDPhase2Fraction)
 
-	log.Printf("[mdns] PTR pacing %v for %d targets (send budget %v)",
+	logger.Infof("[mdns] PTR pacing %v for %d targets (send budget %v)",
 		pacing, r.targetCount, time.Duration(float64(r.timeout)*ptrSendBudget))
 
 	go runDNSSDSender(d, phase2)
@@ -60,8 +54,8 @@ func (r *MDNSResolver) Resolve(ctx context.Context, targets []string, results ch
 
 	for {
 		select {
-		case r := <-d.resultCh:
-			results <- r
+		case res := <-d.resultCh:
+			results <- res
 		case <-d.done:
 			return nil
 		case <-ctx.Done():
@@ -118,7 +112,7 @@ func runPTRSender(ctx context.Context, d *Dispatcher, targets []string, pacing t
 	}
 
 	wg.Wait()
-	log.Printf("[mdns] all PTR queries sent")
+	logger.Infof("[mdns] all PTR queries sent")
 }
 
 func runDNSSDSender(d *Dispatcher, phase2Duration time.Duration) {

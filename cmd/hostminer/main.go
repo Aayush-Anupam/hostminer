@@ -1,5 +1,5 @@
 // Command hostminer scans a subnet and discovers hostnames using multiple
-// resolution strategies (mDNS, and more to come) running in parallel.
+// resolution strategies (mDNS, NetBIOS, …) running in parallel.
 //
 // Usage:
 //
@@ -16,8 +16,11 @@
 //	# Specify interface by name (Linux/macOS)
 //	hostminer --target 192.168.1.0/24 --interface eth0
 //
-//	# Use specific resolution methods (comma-separated)
-//	hostminer --target 192.168.1.0/24 --methods mdns
+//	# Run both mDNS and NetBIOS in parallel
+//	hostminer --target 192.168.1.0/24 --methods mdns,netbios
+//
+//	# NetBIOS only, with custom worker pool and timeout
+//	hostminer --target 192.168.1.0/24 --methods netbios --netbios-workers 20 --netbios-timeout 3s
 //
 //	# Shorter timeout with verbose logging
 //	hostminer --target 192.168.1.0/24 --timeout 10s --verbose
@@ -27,20 +30,22 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
-	"log"
 	"os"
 	"strings"
 
 	"hostminer"
+	"hostminer/internal/logger"
 )
 
 func main() {
 	target := flag.String("target", "", "Target subnet in CIDR notation (required), e.g. 192.168.1.0/24")
 	iface := flag.String("interface", "", "Network interface: IP (192.168.1.5), name (eth0/Wi-Fi), or empty for auto-detect")
 	timeout := flag.Duration("timeout", hostminer.ProbeTimeout, "How long to scan for responses")
-	methods := flag.String("methods", "", "Comma-separated resolution methods (default: mdns)")
-	verbose := flag.Bool("verbose", false, "Print verbose diagnostic output to stderr")
+	methods := flag.String("methods", "", "Comma-separated resolution methods: mdns, netbios (default: mdns)")
+	netbiosWorkers := flag.Int("netbios-workers", hostminer.DefaultNetBIOSWorkers, "Number of parallel NetBIOS UDP workers")
+	netbiosTimeout := flag.Duration("netbios-timeout", hostminer.DefaultNetBIOSTimeout, "Per-IP NetBIOS query timeout")
+	v := flag.Bool("v", false, "Verbose: show info-level logs on stderr")
+	vv := flag.Bool("vv", false, "Very verbose: show debug-level logs on stderr (implies -v)")
 	flag.Parse()
 
 	if *target == "" {
@@ -50,17 +55,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	if !*verbose {
-		log.SetOutput(io.Discard)
-	} else {
-		log.SetFlags(log.Ltime | log.Lmicroseconds)
+	switch {
+	case *vv:
+		logger.SetLevel(logger.LevelDebug)
+	case *v:
+		logger.SetLevel(logger.LevelInfo)
 	}
 
 	results, err := hostminer.Probe(context.Background(), hostminer.Options{
-		CIDR:      *target,
-		Interface: *iface,
-		Timeout:   *timeout,
-		Methods:   parseMethods(*methods),
+		CIDR:           *target,
+		Interface:      *iface,
+		Timeout:        *timeout,
+		Methods:        parseMethods(*methods),
+		NetBIOSWorkers: *netbiosWorkers,
+		NetBIOSTimeout: *netbiosTimeout,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -69,7 +77,7 @@ func main() {
 
 	fmt.Printf("\n=== hostminer results for %s ===\n", *target)
 	for _, r := range results {
-		fmt.Printf("%-18s  %s\n", r.IP, r.Hostname)
+		fmt.Printf("%-18s  %-10s  %s\n", r.IP, "["+string(r.Method)+"]", r.Hostname)
 	}
 	fmt.Printf("\nTotal: %d host(s) found\n", len(results))
 }

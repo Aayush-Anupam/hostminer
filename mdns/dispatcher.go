@@ -1,15 +1,17 @@
-package hostminer
+package mdns
 
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
+
+	"hostminer/internal/logger"
+	"hostminer/internal/proto"
 )
 
 // Dispatcher owns the single shared UDP multicast socket for an mDNS scan.
@@ -18,7 +20,7 @@ import (
 type Dispatcher struct {
 	conn          *net.UDPConn
 	dest          *net.UDPAddr
-	resultCh      chan HostResult
+	resultCh      chan proto.HostResult
 	globalDnsSdCh chan string
 	done          chan struct{}
 	closeOnce     sync.Once
@@ -39,7 +41,7 @@ func NewDispatcher(iface *net.Interface, bindIP net.IP) (*Dispatcher, error) {
 	d := &Dispatcher{
 		conn:          conn,
 		dest:          dest,
-		resultCh:      make(chan HostResult, resultChBuffer),
+		resultCh:      make(chan proto.HostResult, resultChBuffer),
 		globalDnsSdCh: make(chan string, 256),
 		done:          make(chan struct{}),
 	}
@@ -58,7 +60,7 @@ func openMulticastSocket(iface *net.Interface, bindIP net.IP) (*net.UDPConn, err
 		return nil, fmt.Errorf("bind %s: %w", bindAddr, err)
 	}
 	conn := pc.(*net.UDPConn)
-	log.Printf("UDP socket bound to %s", bindAddr)
+	logger.Infof("UDP socket bound to %s", bindAddr)
 
 	p := ipv4.NewPacketConn(conn)
 	group := &net.UDPAddr{IP: net.ParseIP(MdnsAddr)}
@@ -67,7 +69,7 @@ func openMulticastSocket(iface *net.Interface, bindIP net.IP) (*net.UDPConn, err
 		return nil, fmt.Errorf("JoinGroup on %s (index %d): %w — check the interface is up and supports multicast",
 			iface.Name, iface.Index, err)
 	}
-	log.Printf("Joined multicast group %s on interface %s", MdnsAddr, iface.Name)
+	logger.Infof("Joined multicast group %s on interface %s", MdnsAddr, iface.Name)
 
 	return conn, nil
 }
@@ -84,11 +86,11 @@ func (d *Dispatcher) Send(name string, qtype uint16) {
 
 	buf, err := msg.Pack()
 	if err != nil {
-		log.Printf("Send: pack error for %s: %v", name, err)
+		logger.Infof("[mdns] Send: pack error for %s: %v", name, err)
 		return
 	}
 	if _, err := d.conn.WriteToUDP(buf, d.dest); err != nil {
-		log.Printf("Send: write error for %s: %v", name, err)
+		logger.Infof("[mdns] Send: write error for %s: %v", name, err)
 	}
 }
 
@@ -98,7 +100,7 @@ func (d *Dispatcher) Close() {
 		close(d.done)
 		d.conn.Close()
 		if n := d.dropped.Load(); n > 0 {
-			log.Printf("WARNING: dropped %d results (resultChBuffer=%d is too small)", n, resultChBuffer)
+			logger.Infof("[mdns] WARNING: dropped %d results (resultChBuffer=%d is too small)", n, resultChBuffer)
 		}
 	})
 }

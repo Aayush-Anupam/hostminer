@@ -2,10 +2,11 @@ package hostminer
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"sort"
 	"strings"
+
+	"hostminer/internal/logger"
 )
 
 // ResolveInterface picks the outbound network interface according to hint:
@@ -115,7 +116,7 @@ func findInterfaceByIP(ipStr string) (*net.Interface, error) {
 	for _, iface := range ifaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
-			log.Printf("warning: cannot read addresses for interface %s: %v", iface.Name, err)
+			logger.Debugf("cannot read addresses for interface %s: %v", iface.Name, err)
 			continue
 		}
 		for _, addr := range addrs {
