@@ -3,11 +3,14 @@ package hostminer
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"sort"
 	"sync"
 	"time"
+
+	"hostminer/internal/logger"
+	"hostminer/mdns"
+	"hostminer/netbios"
 )
 
 type Options struct {
@@ -15,6 +18,11 @@ type Options struct {
 	Interface string
 	Timeout   time.Duration
 	Methods   []Method
+
+	// NetBIOS tuning — only used when MethodNetBIOS is included in Methods.
+	// Zero values fall back to DefaultNetBIOSWorkers / DefaultNetBIOSTimeout.
+	NetBIOSWorkers int
+	NetBIOSTimeout time.Duration
 }
 
 // Probe discovers hostnames for all IPs in opts.CIDR by running every
@@ -27,21 +35,16 @@ func Probe(ctx context.Context, opts Options) ([]HostResult, error) {
 		return nil, fmt.Errorf("Options.CIDR is required")
 	}
 
-	iface, bindIP, err := prepareInterface(opts.Interface, opts.CIDR)
-	if err != nil {
-		return nil, err
-	}
-
 	targets, err := hostsFromCIDR(opts.CIDR)
 	if err != nil {
 		return nil, fmt.Errorf("expand CIDR %q: %w", opts.CIDR, err)
 	}
-	log.Printf("Scanning %d hosts in %s via interface %s", len(targets), opts.CIDR, iface.Name)
 
-	resolvers, err := buildResolvers(opts.Methods, iface, bindIP, opts.Timeout, len(targets))
+	resolvers, err := buildResolvers(opts, targets)
 	if err != nil {
 		return nil, err
 	}
+	logger.Infof("Scanning %d hosts in %s with methods %v", len(targets), opts.CIDR, opts.Methods)
 
 	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
@@ -57,7 +60,60 @@ func applyDefaults(opts Options) Options {
 	if len(opts.Methods) == 0 {
 		opts.Methods = DefaultMethods
 	}
+	if opts.NetBIOSWorkers == 0 {
+		opts.NetBIOSWorkers = DefaultNetBIOSWorkers
+	}
+	if opts.NetBIOSTimeout == 0 {
+		opts.NetBIOSTimeout = DefaultNetBIOSTimeout
+	}
 	return opts
+}
+
+// needsMDNS reports whether any of the requested methods require mDNS.
+func needsMDNS(methods []Method) bool {
+	for _, m := range methods {
+		if m == MethodMDNS {
+			return true
+		}
+	}
+	return false
+}
+
+// buildResolvers instantiates the concrete [Resolver] for each requested method.
+// Interface resolution and multicast validation are only performed when mDNS is
+// in the method list.
+func buildResolvers(opts Options, targets []string) ([]Resolver, error) {
+	var resolvers []Resolver
+
+	// Resolve the network interface once, only when mDNS needs it.
+	var iface *net.Interface
+	var bindIP net.IP
+
+	if needsMDNS(opts.Methods) {
+		var err error
+		iface, bindIP, err = prepareInterface(opts.Interface, opts.CIDR)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, m := range opts.Methods {
+		switch m {
+		case MethodMDNS:
+			resolvers = append(resolvers, mdns.NewResolver(iface, bindIP, opts.Timeout, len(targets)))
+		case MethodNetBIOS:
+			resolvers = append(resolvers, netbios.NewResolver(netbios.Options{
+				Workers: opts.NetBIOSWorkers,
+				Timeout: opts.NetBIOSTimeout,
+			}))
+		default:
+			logger.Infof("warning: unknown resolution method %q — skipping", m)
+		}
+	}
+	if len(resolvers) == 0 {
+		return nil, fmt.Errorf("no valid resolution methods specified")
+	}
+	return resolvers, nil
 }
 
 func prepareInterface(hint, cidr string) (*net.Interface, net.IP, error) {
@@ -72,26 +128,9 @@ func prepareInterface(hint, cidr string) (*net.Interface, net.IP, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("interface IP: %w", err)
 	}
-	log.Printf("Using interface %s (index %d, flags %s, MTU %d, IP %s)",
+	logger.Infof("Using interface %s (index %d, flags %s, MTU %d, IP %s)",
 		iface.Name, iface.Index, iface.Flags, iface.MTU, ip)
 	return iface, ip, nil
-}
-
-// buildResolvers instantiates the concrete [Resolver] for each requested method.
-func buildResolvers(methods []Method, iface *net.Interface, bindIP net.IP, timeout time.Duration, targetCount int) ([]Resolver, error) {
-	var resolvers []Resolver
-	for _, m := range methods {
-		switch m {
-		case MethodMDNS:
-			resolvers = append(resolvers, NewMDNSResolver(iface, bindIP, timeout, targetCount))
-		default:
-			log.Printf("warning: unknown resolution method %q — skipping", m)
-		}
-	}
-	if len(resolvers) == 0 {
-		return nil, fmt.Errorf("no valid resolution methods specified")
-	}
-	return resolvers, nil
 }
 
 // runResolversInParallel launches each resolver in its own goroutine and
@@ -106,7 +145,7 @@ func runResolversInParallel(ctx context.Context, resolvers []Resolver, targets [
 		go func() {
 			defer wg.Done()
 			if err := r.Resolve(ctx, targets, merged); err != nil {
-				log.Printf("resolver %s error: %v", r.Name(), err)
+				logger.Infof("resolver %s error: %v", r.Name(), err)
 			}
 		}()
 	}
@@ -122,7 +161,7 @@ func collectResults(ctx context.Context, ch <-chan HostResult, targets []string)
 		targetSet[ip] = true
 	}
 
-	seen := make(map[string]string, 64)
+	seen := make(map[string]HostResult, 64)
 loop:
 	for {
 		select {
@@ -132,10 +171,10 @@ loop:
 			}
 			if targetSet[r.IP] {
 				if _, already := seen[r.IP]; !already {
-					seen[r.IP] = r.Hostname
-					log.Printf("found: %-18s  %s", r.IP, r.Hostname)
+					seen[r.IP] = r
+					logger.Infof("found [%s]: %-18s  %s", r.Method, r.IP, r.Hostname)
 					if len(seen) == len(targets) {
-						log.Printf("all %d targets resolved — stopping early", len(targets))
+						logger.Infof("all %d targets resolved — stopping early", len(targets))
 						break loop
 					}
 				}
@@ -146,8 +185,8 @@ loop:
 	}
 
 	results := make([]HostResult, 0, len(seen))
-	for ip, hostname := range seen {
-		results = append(results, HostResult{IP: ip, Hostname: hostname})
+	for _, r := range seen {
+		results = append(results, r)
 	}
 	sort.Slice(results, func(i, j int) bool { return results[i].IP < results[j].IP })
 	return results

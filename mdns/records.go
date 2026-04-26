@@ -1,4 +1,4 @@
-package hostminer
+package mdns
 
 import (
 	"strings"

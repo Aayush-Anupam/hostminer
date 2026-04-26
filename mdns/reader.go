@@ -1,9 +1,10 @@
-package hostminer
+package mdns
 
 import (
-	"log"
-
 	"github.com/miekg/dns"
+
+	"hostminer/internal/logger"
+	"hostminer/internal/proto"
 )
 
 // readLoop runs in a background goroutine for the lifetime of the Dispatcher.
@@ -11,16 +12,16 @@ import (
 // fans the extracted data into the appropriate channels.
 func (d *Dispatcher) readLoop() {
 	buf := make([]byte, 65536)
-	log.Printf("readLoop started — listening for mDNS responses")
+	logger.Debugf("[mdns] readLoop started")
 
 	for {
 		n, _, err := d.conn.ReadFromUDP(buf)
 		if err != nil {
 			select {
 			case <-d.done:
-				// clean shutdown — error is expected
+				// clean shutdown
 			default:
-				log.Printf("readLoop: unexpected socket read error: %v", err)
+				logger.Infof("[mdns] readLoop: unexpected socket read error: %v", err)
 			}
 			return
 		}
@@ -50,7 +51,7 @@ func (d *Dispatcher) dispatchMessage(msg *dns.Msg) {
 
 	for ip, hostname := range extractHostResults(all) {
 		select {
-		case d.resultCh <- HostResult{IP: ip, Hostname: hostname}:
+		case d.resultCh <- proto.HostResult{IP: ip, Hostname: hostname, Method: proto.MethodMDNS}:
 		default:
 			d.dropped.Add(1)
 		}

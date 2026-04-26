@@ -1,31 +1,25 @@
 package hostminer
 
-import "context"
+import "hostminer/internal/proto"
 
-// HostResult is a single ip→hostname pair discovered from the network.
-type HostResult struct {
-	IP       string
-	Hostname string
-}
+// Re-export shared types and constants so callers that import the root
+// hostminer package do not need to know about the internal/proto package.
+
+// HostResult is a single ip→hostname pair discovered from the network,
+// tagged with the protocol that found it.
+type HostResult = proto.HostResult
+
+// Resolver is the interface implemented by each resolution strategy.
+type Resolver = proto.Resolver
 
 // Method identifies a hostname-resolution strategy.
-type Method string
+type Method = proto.Method
 
 const (
-	MethodMDNS Method = "mdns"
-	// MethodNetBIOS Method = "netbios"
-	// MethodRDNS    Method = "rdns"
+	MethodMDNS    = proto.MethodMDNS
+	MethodNetBIOS = proto.MethodNetBIOS
 )
 
 // DefaultMethods is used when Options.Methods is empty.
-var DefaultMethods = []Method{MethodMDNS}
-
-// Resolver is the interface implemented by each hostname-resolution strategy
-// (mDNS, NetBIOS, rDNS, …). All resolvers are launched in parallel by Probe;
-// each writes discovered ip→hostname pairs to results until ctx is cancelled.
-type Resolver interface {
-	// Name returns a human-readable label used in log messages.
-	Name() string
-	// Resolve runs until ctx is cancelled, writing results to the shared channel.
-	Resolve(ctx context.Context, targets []string, results chan<- HostResult) error
-}
+// All supported resolution strategies are run in parallel by default.
+var DefaultMethods = []Method{proto.MethodMDNS, proto.MethodNetBIOS}
