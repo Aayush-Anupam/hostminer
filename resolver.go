@@ -18,8 +18,9 @@ type Method = proto.Method
 const (
 	MethodMDNS    = proto.MethodMDNS
 	MethodNetBIOS = proto.MethodNetBIOS
+	MethodRDNS    = proto.MethodRDNS
 )
 
 // DefaultMethods is used when Options.Methods is empty.
 // All supported resolution strategies are run in parallel by default.
-var DefaultMethods = []Method{proto.MethodMDNS, proto.MethodNetBIOS}
+var DefaultMethods = []Method{proto.MethodMDNS, proto.MethodNetBIOS, proto.MethodRDNS}

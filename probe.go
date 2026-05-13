@@ -11,6 +11,7 @@ import (
 	"hostminer/internal/logger"
 	"hostminer/mdns"
 	"hostminer/netbios"
+	"hostminer/rdns"
 )
 
 type Options struct {
@@ -22,6 +23,10 @@ type Options struct {
 	// NetBIOS tuning — only used when MethodNetBIOS is included in Methods.
 	// Zero value falls back to DefaultNetBIOSTimeout.
 	NetBIOSTimeout time.Duration
+
+	// RDNSTimeout is the total PTR-lookup budget when MethodRDNS is active.
+	// Zero value falls back to DefaultRDNSTimeout.
+	RDNSTimeout time.Duration
 }
 
 // Probe discovers hostnames for all IPs in opts.CIDR by running every
@@ -62,6 +67,9 @@ func applyDefaults(opts Options) Options {
 	if opts.NetBIOSTimeout == 0 {
 		opts.NetBIOSTimeout = DefaultNetBIOSTimeout
 	}
+	if opts.RDNSTimeout == 0 {
+		opts.RDNSTimeout = DefaultRDNSTimeout
+	}
 	return opts
 }
 
@@ -100,6 +108,10 @@ func buildResolvers(opts Options, targets []string) ([]Resolver, error) {
 		case MethodNetBIOS:
 			resolvers = append(resolvers, netbios.NewResolver(netbios.Options{
 				Timeout: opts.NetBIOSTimeout,
+			}))
+		case MethodRDNS:
+			resolvers = append(resolvers, rdns.NewResolver(rdns.Options{
+				Timeout: opts.RDNSTimeout,
 			}))
 		default:
 			logger.Infof("warning: unknown resolution method %q — skipping", m)

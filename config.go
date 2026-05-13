@@ -12,4 +12,10 @@ const (
 	// DefaultNetBIOSTimeout is the per-IP NetBIOS scan deadline used when
 	// Options.NetBIOSTimeout is zero.
 	DefaultNetBIOSTimeout = 2 * time.Second
+
+	// DefaultRDNSTimeout is the total PTR-lookup budget used when
+	// Options.RDNSTimeout is zero.
+	// 30 s accommodates a full /16 (65 534 IPs) at 512 workers with
+	// typical LAN DNS RTTs (50–200 ms per lookup).
+	DefaultRDNSTimeout = 30 * time.Second
 )
