@@ -2,13 +2,12 @@ package netbios
 
 import "encoding/binary"
 
-// buildNBSTATQuery constructs a NetBIOS Node Status Request (RFC 1002 §4.2.18).
-// It queries the wildcard name "*" with NBSTAT question type (0x0021).
-func buildNBSTATQuery() []byte {
+// buildNBSTATQueryWithTxID constructs a NetBIOS Node Status Request
+// (RFC 1002 §4.2.18) with the supplied transaction ID, which is echoed back in
+// the response and used to correlate replies on a shared socket.
+func buildNBSTATQueryWithTxID(txID uint16) []byte {
 	query := make([]byte, 50)
-
-	// Transaction ID: 0x1234 (arbitrary, not validated by most implementations)
-	binary.BigEndian.PutUint16(query[0:2], 0x1234)
+	binary.BigEndian.PutUint16(query[0:2], txID)
 	// Flags: 0x0000 → standard query, no recursion
 	binary.BigEndian.PutUint16(query[2:4], 0x0000)
 	// QDCOUNT = 1 question
