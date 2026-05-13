@@ -1,5 +1,5 @@
 // Command hostminer scans a subnet and discovers hostnames using multiple
-// resolution strategies (mDNS, NetBIOS, …) running in parallel.
+// resolution strategies (mDNS, NetBIOS, rDNS) running in parallel.
 //
 // Usage:
 //
@@ -16,11 +16,14 @@
 //	# Specify interface by name (Linux/macOS)
 //	hostminer --target 192.168.1.0/24 --interface eth0
 //
-//	# Run both mDNS and NetBIOS in parallel
-//	hostminer --target 192.168.1.0/24 --methods mdns,netbios
+//	# Run all three methods in parallel (default)
+//	hostminer --target 192.168.1.0/24 --methods mdns,netbios,rdns
 //
 //	# NetBIOS only, with custom timeout
 //	hostminer --target 192.168.1.0/24 --methods netbios --netbios-timeout 3s
+//
+//	# rDNS only, with custom lookup budget
+//	hostminer --target 192.168.1.0/24 --methods rdns --rdns-timeout 10s
 //
 //	# Shorter timeout with verbose logging
 //	hostminer --target 192.168.1.0/24 --timeout 10s --verbose
@@ -41,8 +44,9 @@ func main() {
 	target := flag.String("target", "", "Target subnet in CIDR notation (required), e.g. 192.168.1.0/24")
 	iface := flag.String("interface", "", "Network interface: IP (192.168.1.5), name (eth0/Wi-Fi), or empty for auto-detect")
 	timeout := flag.Duration("timeout", hostminer.ProbeTimeout, "How long to scan for responses")
-	methods := flag.String("methods", "", "Comma-separated resolution methods: mdns, netbios (default: mdns)")
+	methods := flag.String("methods", "", "Comma-separated resolution methods: mdns, netbios, rdns (default: all three)")
 	netbiosTimeout := flag.Duration("netbios-timeout", hostminer.DefaultNetBIOSTimeout, "Per-scan NetBIOS reply deadline")
+	rdnsTimeout := flag.Duration("rdns-timeout", hostminer.DefaultRDNSTimeout, "Total budget for reverse-DNS (PTR) lookups")
 	v := flag.Bool("v", false, "Verbose: show info-level logs on stderr")
 	vv := flag.Bool("vv", false, "Very verbose: show debug-level logs on stderr (implies -v)")
 	flag.Parse()
@@ -67,6 +71,7 @@ func main() {
 		Timeout:        *timeout,
 		Methods:        parseMethods(*methods),
 		NetBIOSTimeout: *netbiosTimeout,
+		RDNSTimeout:    *rdnsTimeout,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
