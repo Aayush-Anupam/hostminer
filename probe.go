@@ -20,8 +20,7 @@ type Options struct {
 	Methods   []Method
 
 	// NetBIOS tuning — only used when MethodNetBIOS is included in Methods.
-	// Zero values fall back to DefaultNetBIOSWorkers / DefaultNetBIOSTimeout.
-	NetBIOSWorkers int
+	// Zero value falls back to DefaultNetBIOSTimeout.
 	NetBIOSTimeout time.Duration
 }
 
@@ -59,9 +58,6 @@ func applyDefaults(opts Options) Options {
 	}
 	if len(opts.Methods) == 0 {
 		opts.Methods = DefaultMethods
-	}
-	if opts.NetBIOSWorkers == 0 {
-		opts.NetBIOSWorkers = DefaultNetBIOSWorkers
 	}
 	if opts.NetBIOSTimeout == 0 {
 		opts.NetBIOSTimeout = DefaultNetBIOSTimeout
@@ -103,7 +99,6 @@ func buildResolvers(opts Options, targets []string) ([]Resolver, error) {
 			resolvers = append(resolvers, mdns.NewResolver(iface, bindIP, opts.Timeout, len(targets)))
 		case MethodNetBIOS:
 			resolvers = append(resolvers, netbios.NewResolver(netbios.Options{
-				Workers: opts.NetBIOSWorkers,
 				Timeout: opts.NetBIOSTimeout,
 			}))
 		default:
