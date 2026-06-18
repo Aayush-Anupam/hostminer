@@ -14,6 +14,7 @@ const (
 	MethodMDNS    Method = "mdns"
 	MethodNetBIOS Method = "netbios"
 	MethodRDNS    Method = "rdns"
+	MethodNTLM    Method = "ntlm"
 )
 
 // HostResult is a single ip→hostname pair discovered from the network,

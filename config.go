@@ -18,4 +18,8 @@ const (
 	// 30 s accommodates a full /16 (65 534 IPs) at 512 workers with
 	// typical LAN DNS RTTs (50–200 ms per lookup).
 	DefaultRDNSTimeout = 30 * time.Second
+
+	// DefaultNTLMTimeout is the per-host RDP probe deadline used when
+	// Options.NTLMTimeout is zero.
+	DefaultNTLMTimeout = 5 * time.Second
 )

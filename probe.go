@@ -11,6 +11,7 @@ import (
 	"hostminer/internal/logger"
 	"hostminer/mdns"
 	"hostminer/netbios"
+	"hostminer/ntlm"
 	"hostminer/rdns"
 )
 
@@ -27,6 +28,10 @@ type Options struct {
 	// RDNSTimeout is the total PTR-lookup budget when MethodRDNS is active.
 	// Zero value falls back to DefaultRDNSTimeout.
 	RDNSTimeout time.Duration
+
+	// NTLMTimeout is the per-host RDP probe deadline when MethodNTLM is active.
+	// Zero value falls back to DefaultNTLMTimeout.
+	NTLMTimeout time.Duration
 }
 
 // Probe discovers hostnames for all IPs in opts.CIDR by running every
@@ -70,6 +75,9 @@ func applyDefaults(opts Options) Options {
 	if opts.RDNSTimeout == 0 {
 		opts.RDNSTimeout = DefaultRDNSTimeout
 	}
+	if opts.NTLMTimeout == 0 {
+		opts.NTLMTimeout = DefaultNTLMTimeout
+	}
 	return opts
 }
 
@@ -112,6 +120,10 @@ func buildResolvers(opts Options, targets []string) ([]Resolver, error) {
 		case MethodRDNS:
 			resolvers = append(resolvers, rdns.NewResolver(rdns.Options{
 				Timeout: opts.RDNSTimeout,
+			}))
+		case MethodNTLM:
+			resolvers = append(resolvers, ntlm.NewResolver(ntlm.Options{
+				Timeout: opts.NTLMTimeout,
 			}))
 		default:
 			logger.Infof("warning: unknown resolution method %q — skipping", m)
