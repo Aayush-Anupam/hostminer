@@ -11,11 +11,16 @@ const (
 	// this if log warnings report dropped results on large subnets.
 	resultChBuffer = 4096
 
-	ptrWorkerCount = 20
-
+	// ptrSendBudget is the fraction of the scan timeout spent sending PTR queries.
 	ptrSendBudget  = 0.45
 	ptrPacingFloor = 50 * time.Microsecond
 	ptrPacingCap   = 1 * time.Millisecond
+
+	// ptrMaxTargets is the largest target list for which PTR queries are sent.
+	// mDNS is link-local and does not cross routers; sending reverse-PTR queries
+	// for IPs outside the local segment produces no responses.  DNS-SD queries
+	// are always sent regardless of subnet size.
+	ptrMaxTargets = 512
 
 	dnsSDInterQueryDelay = 20 * time.Millisecond
 	dnsSDPhase2Fraction  = 0.25

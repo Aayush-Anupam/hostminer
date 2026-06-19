@@ -19,16 +19,19 @@ const (
 	netbiosUDPNetwork = "udp4"
 	netbiosBindAddr   = ":0"
 
-	// sendPace is the minimum gap between successive NBSTAT sends.
-	// 500 µs ≈ 2 000 packets/s — fast enough to blast 254 hosts in ~130 ms
-	// while avoiding local kernel-buffer drops.
-	sendPace = 500 * time.Microsecond
+	// sendBudgetFrac is the fraction of the scan timeout allocated to wave-1 sends.
+	// The remainder is reserved for receiving replies and the optional wave-2 retransmit.
+	sendBudgetFrac = 0.35
 
-	// retransmitAfter is how long to wait before re-sending to hosts that
-	// have not yet replied.
-	retransmitAfter = 900 * time.Millisecond
+	// PacingFloor / PacingCap bound the inter-packet delay.
+	// 100 µs → 10 000 pkt/s, safe for gigabit Ethernet.
+	// 1 ms  →  1 000 pkt/s, conservative floor for small subnets.
+	PacingFloor = 100 * time.Microsecond
+	PacingCap   = 1 * time.Millisecond
 
-	// defaultTimeout is the total wait for any reply after the last send wave.
+	// retransmitBuffer is the pause between wave-1 completion and wave-2 start.
+	retransmitBuffer = 200 * time.Millisecond
+
 	defaultTimeout = 2 * time.Second
 )
 
@@ -59,10 +62,29 @@ func NewResolver(opts Options) *Resolver {
 
 func (r *Resolver) Name() string { return string(proto.MethodNetBIOS) }
 
+// ComputePacing returns the inter-packet delay for NBSTAT wave sends.
+// It allocates sendBudgetFrac of the timeout to the send phase, then clamps
+// to [PacingFloor, PacingCap].  Exported so the orchestrator can estimate
+// wave-1 duration when scheduling dependent resolvers (e.g. NTLM start delay).
+func ComputePacing(timeout time.Duration, targetCount int) time.Duration {
+	if targetCount == 0 {
+		return PacingCap
+	}
+	budget := time.Duration(float64(timeout) * sendBudgetFrac)
+	pacing := budget / time.Duration(targetCount)
+	if pacing < PacingFloor {
+		return PacingFloor
+	}
+	if pacing > PacingCap {
+		return PacingCap
+	}
+	return pacing
+}
+
 // Resolve opens a single shared UDP socket, fires NBSTAT queries at all
-// targets in rapid succession, then collects responses asynchronously.
-// After retransmitAfter it re-sends to every host that has not yet replied,
-// then waits until the overall timeout expires.
+// targets (wave 1), then retransmits to non-responders 200 ms after wave 1
+// completes (wave 2).  Replies are collected asynchronously until the overall
+// timeout expires or ctx is cancelled.
 func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<- proto.HostResult) error {
 	if len(targets) == 0 {
 		return nil
@@ -74,8 +96,6 @@ func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<-
 	}
 	defer conn.Close()
 
-	// Assign each target a unique transaction ID so responses can be
-	// correlated without inspecting the source IP.
 	type entry struct {
 		ip   string
 		txID uint16
@@ -89,18 +109,16 @@ func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<-
 		byTxID[txID] = ip
 	}
 
-	// responded tracks IPs that have already replied (protected by mu).
 	var mu sync.Mutex
 	responded := make(map[string]bool, len(targets))
 
-	// deadline is when we stop reading altogether.
 	deadline := time.Now().Add(r.opts.Timeout)
 	if err = conn.SetReadDeadline(deadline); err != nil {
 		return err
 	}
 
-	// sendAll blasts NBSTAT queries to all pending (non-responded) hosts and
-	// returns the number of packets actually sent.
+	pacing := ComputePacing(r.opts.Timeout, len(targets))
+
 	sendAll := func() int {
 		sent := 0
 		for _, e := range entries {
@@ -120,14 +138,12 @@ func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<-
 				logger.Debugf("[netbios] write error for %s: %v", e.ip, werr)
 				continue
 			}
-			logger.Debugf("[netbios] NBSTAT sent -> %s", e.ip)
 			sent++
-			time.Sleep(sendPace)
+			time.Sleep(pacing)
 		}
 		return sent
 	}
 
-	// Reader goroutine — runs until read deadline or ctx cancellation.
 	var readerWg sync.WaitGroup
 	readerWg.Add(1)
 	go func() {
@@ -136,7 +152,7 @@ func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<-
 		for {
 			n, src, rerr := conn.ReadFrom(buf)
 			if rerr != nil {
-				return // deadline or closed
+				return
 			}
 			srcUDP, ok := src.(*net.UDPAddr)
 			if !ok || srcUDP.Port != netbiosPort || n < 2 {
@@ -158,34 +174,29 @@ func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<-
 				continue
 			}
 			select {
-			case results <- proto.HostResult{
-				IP:       ip,
-				Hostname: hostname,
-				Method:   proto.MethodNetBIOS,
-			}:
+			case results <- proto.HostResult{IP: ip, Hostname: hostname, Method: proto.MethodNetBIOS}:
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
 
-	// Wave 1: send to everyone.
 	n1 := sendAll()
-	logger.Infof("[netbios] all %d NBSTAT queries sent (wave 1)", n1)
+	logger.Infof("[netbios] wave 1: %d queries sent (pacing %v)", n1, pacing)
 
-	// Wave 2: after retransmitAfter, re-send to hosts that haven't replied yet.
+	// Wave 2 fires retransmitBuffer after wave 1 finishes, not on a fixed clock,
+	// so it is always correct regardless of how long wave 1 took.
 	select {
 	case <-ctx.Done():
 		conn.Close()
 		readerWg.Wait()
 		return ctx.Err()
-	case <-time.After(retransmitAfter):
+	case <-time.After(retransmitBuffer):
 	}
 	if n2 := sendAll(); n2 > 0 {
-		logger.Infof("[netbios] retransmitted %d NBSTAT queries (wave 2)", n2)
+		logger.Infof("[netbios] wave 2: %d queries retransmitted", n2)
 	}
 
-	// Wait for the read deadline to expire (or ctx cancel), then close.
 	select {
 	case <-ctx.Done():
 		conn.Close()
@@ -197,6 +208,6 @@ func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<-
 	mu.Lock()
 	n := len(responded)
 	mu.Unlock()
-	logger.Infof("[netbios] all %d requests processed (%d responded)", len(targets), n)
+	logger.Infof("[netbios] done (%d/%d responded)", n, len(targets))
 	return nil
 }
