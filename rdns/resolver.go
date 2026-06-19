@@ -18,16 +18,13 @@ const (
 	ptrMaxAttempts = 3
 
 	// maxWorkers is the upper bound on concurrent PTR goroutines.
-	// PTR lookups are cheap goroutines (no persistent FD), so we can afford
-	// a high cap. In practice the OS resolver and upstream DNS server are
-	// the real bottleneck, not goroutine count.
-	maxWorkers = 512
+	// The real bottleneck is the upstream DNS resolver (typically 500–2 000
+	// queries/s on a LAN).  Beyond ~128 workers you are queuing at the server,
+	// not gaining throughput.
+	maxWorkers = 128
 
-	// defaultTimeout is the total deadline for all PTR lookups.
-	// rDNS is I/O-bound and serial within each worker, so this must be
-	// large enough for ceil(targets/workers) * perLookupRTT * ptrMaxAttempts.
-	// 30 s covers a full /16 (65534 IPs, 512 workers, ~128 rounds) at typical
-	// LAN DNS RTTs (50–200 ms).
+	// defaultTimeout is the total deadline for all PTR lookups when
+	// Options.Timeout is zero and no global timeout is provided.
 	defaultTimeout = 30 * time.Second
 )
 

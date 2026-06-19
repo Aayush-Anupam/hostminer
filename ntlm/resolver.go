@@ -1,6 +1,10 @@
 // Package ntlm resolves hostnames by probing RDP (port 3389) and extracting
 // the computer name from the NTLM Type-2 challenge returned during the
 // CredSSP/NLA handshake, with a TLS certificate CN as fallback.
+//
+// NTLM is the resolver of last resort.  It accepts a [proto.ResolvedSet] and a
+// start delay at construction time so it yields to faster UDP-based resolvers
+// before opening TCP connections.  Passing nil for resolved is safe.
 package ntlm
 
 import (
@@ -19,10 +23,14 @@ import (
 )
 
 const (
-	rdpPort        = ":3389"
-	ntlmSignature  = "NTLMSSP\x00"
-	defaultTimeout = 5 * time.Second
-	maxWorkers     = 64
+	rdpPort       = ":3389"
+	ntlmSignature = "NTLMSSP\x00"
+
+	// defaultTimeout is intentionally short for LAN scanning where closed ports
+	// respond with RST immediately.  Raise it (e.g. 3–5 s) for internet targets.
+	defaultTimeout = 1 * time.Second
+
+	maxWorkers = 64
 )
 
 // ntlmNegotiateBlob is a minimal NTLM NEGOTIATE_MESSAGE (Type-1).
@@ -38,7 +46,7 @@ var ntlmNegotiateBlob = []byte{
 // Options customises the NTLM/RDP resolver.
 type Options struct {
 	// Timeout is the per-host RDP probe deadline.
-	// Defaults to 5 s.
+	// Defaults to 1 s (LAN).  Use 3–5 s for internet targets.
 	Timeout time.Duration
 }
 
@@ -49,43 +57,73 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
-// Resolver implements [proto.Resolver] by probing RDP port 3389 and parsing
-// the NTLM Type-2 challenge for the NetBIOS computer name.
+// Resolver implements [proto.Resolver] by probing TCP/3389 and parsing the
+// NTLM Type-2 challenge for the NetBIOS/DNS computer name.
 type Resolver struct {
-	opts Options
-	dial func(network, address string) (net.Conn, error)
+	opts       Options
+	dial       func(ctx context.Context, network, address string) (net.Conn, error)
+	resolved   *proto.ResolvedSet
+	startAfter time.Duration
 }
 
-// NewResolver creates a new NTLM/RDP Resolver with the given options.
-func NewResolver(opts Options) *Resolver {
+// NewResolver creates a new NTLM/RDP Resolver.
+//
+//   - resolved: shared cross-resolver set; hosts already in the set are
+//     skipped before dialing.  Pass nil to disable skip-on-resolved.
+//   - startAfter: how long to wait before probing, giving faster UDP resolvers
+//     time to populate resolved first.  Pass 0 to start immediately.
+func NewResolver(opts Options, resolved *proto.ResolvedSet, startAfter time.Duration) *Resolver {
 	return &Resolver{
-		opts: opts.withDefaults(),
-		dial: net.Dial,
+		opts:       opts.withDefaults(),
+		dial:       (&net.Dialer{}).DialContext,
+		resolved:   resolved,
+		startAfter: startAfter,
 	}
 }
 
 func (r *Resolver) Name() string { return string(proto.MethodNTLM) }
 
 // Resolve probes each target on TCP/3389 concurrently and writes resolved
-// hostnames to results. It returns when all workers are done or ctx is
-// cancelled.
+// hostnames to results.  It honours startAfter and skips IPs already in the
+// resolved set, both before building the work queue and again just before
+// dialing (so hosts resolved during the start-delay window are also skipped).
 func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<- proto.HostResult) error {
 	if len(targets) == 0 {
 		return nil
 	}
 
-	ipCh := make(chan string, len(targets))
+	if r.startAfter > 0 {
+		logger.Infof("[ntlm] waiting %v for UDP resolvers before starting", r.startAfter)
+		select {
+		case <-time.After(r.startAfter):
+		case <-ctx.Done():
+			return nil
+		}
+	}
+
+	var pending []string
 	for _, ip := range targets {
+		if !r.resolved.Has(ip) {
+			pending = append(pending, ip)
+		}
+	}
+	if len(pending) == 0 {
+		logger.Infof("[ntlm] all targets already resolved — skipping")
+		return nil
+	}
+
+	ipCh := make(chan string, len(pending))
+	for _, ip := range pending {
 		ipCh <- ip
 	}
 	close(ipCh)
 
-	workers := len(targets)
+	workers := len(pending)
 	if workers > maxWorkers {
 		workers = maxWorkers
 	}
-
-	logger.Infof("[ntlm] probing %d targets (%d workers, timeout %v)", len(targets), workers, r.opts.Timeout)
+	logger.Infof("[ntlm] probing %d/%d targets (%d workers, per-host timeout %v)",
+		len(pending), len(targets), workers, r.opts.Timeout)
 
 	var found atomic.Int32
 	var wg sync.WaitGroup
@@ -101,7 +139,11 @@ func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<-
 					if !ok {
 						return
 					}
-					name := resolveNTLM(ip, r.dial, r.opts.Timeout)
+					// Second check: may have been resolved while we waited in the queue.
+					if r.resolved.Has(ip) {
+						continue
+					}
+					name := resolveNTLM(ctx, ip, r.dial, r.opts.Timeout)
 					if name == "" {
 						continue
 					}
@@ -116,14 +158,12 @@ func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<-
 		}()
 	}
 	wg.Wait()
-	logger.Infof("[ntlm] done (%d/%d resolved)", found.Load(), len(targets))
+	logger.Infof("[ntlm] done (%d resolved)", found.Load())
 	return nil
 }
 
-// resolveNTLM probes ip:3389, performs the RDP/NTLM handshake, and returns
-// the best hostname it can extract (NbComputerName > DnsComputerName > TLS CN).
-func resolveNTLM(ip string, dial func(network, address string) (net.Conn, error), timeout time.Duration) string {
-	result := probeRDP(ip, dial, timeout)
+func resolveNTLM(ctx context.Context, ip string, dial func(context.Context, string, string) (net.Conn, error), timeout time.Duration) string {
+	result := probeRDP(ctx, ip, dial, timeout)
 	if result.err != nil {
 		logger.Debugf("[ntlm] %s: %v", ip, result.err)
 		return ""
@@ -136,11 +176,10 @@ func resolveNTLM(ip string, dial func(network, address string) (net.Conn, error)
 		logger.Infof("[ntlm] %s → %s (source: %s)", ip, result.dnsComputerName, result.hostnameSource)
 		return result.dnsComputerName
 	}
-	logger.Debugf("[ntlm] %s: handshake succeeded but no hostname found", ip)
+	logger.Debugf("[ntlm] %s: handshake succeeded but no hostname extracted", ip)
 	return ""
 }
 
-// rdpInfo holds the data extracted from a single RDP probe.
 type rdpInfo struct {
 	nbComputerName  string
 	dnsComputerName string
@@ -148,13 +187,18 @@ type rdpInfo struct {
 	err             error
 }
 
-func probeRDP(ip string, dial func(network, address string) (net.Conn, error), timeout time.Duration) rdpInfo {
-	conn, err := dial("tcp", ip+rdpPort)
+func probeRDP(ctx context.Context, ip string, dial func(context.Context, string, string) (net.Conn, error), timeout time.Duration) rdpInfo {
+	// Per-host context: cancels the dial immediately if the parent is cancelled.
+	hostCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	conn, err := dial(hostCtx, "tcp", ip+rdpPort)
 	if err != nil {
 		return rdpInfo{err: err}
 	}
 	defer conn.Close()
 
+	// SetDeadline governs all subsequent protocol I/O on the established connection.
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return rdpInfo{err: fmt.Errorf("set deadline: %w", err)}
 	}

@@ -9,34 +9,35 @@ import (
 	"time"
 
 	"hostminer/internal/logger"
+	"hostminer/internal/proto"
 	"hostminer/mdns"
 	"hostminer/netbios"
 	"hostminer/ntlm"
 	"hostminer/rdns"
 )
 
+// Options controls a single Probe run.
 type Options struct {
 	CIDR      string
 	Interface string
 	Timeout   time.Duration
 	Methods   []Method
 
-	// NetBIOS tuning — only used when MethodNetBIOS is included in Methods.
-	// Zero value falls back to DefaultNetBIOSTimeout.
+	// Per-method timeout overrides.  A zero value falls back to the defaults
+	// described on each constant in config.go.
 	NetBIOSTimeout time.Duration
-
-	// RDNSTimeout is the total PTR-lookup budget when MethodRDNS is active.
-	// Zero value falls back to DefaultRDNSTimeout.
+	// RDNSTimeout is the total PTR-lookup budget.  Zero means use Timeout.
 	RDNSTimeout time.Duration
-
-	// NTLMTimeout is the per-host RDP probe deadline when MethodNTLM is active.
-	// Zero value falls back to DefaultNTLMTimeout.
 	NTLMTimeout time.Duration
 }
 
 // Probe discovers hostnames for all IPs in opts.CIDR by running every
-// requested [Resolver] in parallel. It blocks until the timeout expires,
+// requested [Resolver] in parallel.  It blocks until the timeout expires,
 // ctx is cancelled, or every target is resolved.
+//
+// Resolution is tiered: rDNS, NetBIOS, and mDNS run immediately; NTLM waits
+// until the UDP resolvers have had time to respond and only probes hosts they
+// did not resolve.
 func Probe(ctx context.Context, opts Options) ([]HostResult, error) {
 	opts = applyDefaults(opts)
 
@@ -49,7 +50,9 @@ func Probe(ctx context.Context, opts Options) ([]HostResult, error) {
 		return nil, fmt.Errorf("expand CIDR %q: %w", opts.CIDR, err)
 	}
 
-	resolvers, err := buildResolvers(opts, targets)
+	resolved := proto.NewResolvedSet()
+
+	resolvers, err := buildResolvers(opts, targets, resolved)
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +62,7 @@ func Probe(ctx context.Context, opts Options) ([]HostResult, error) {
 	defer cancel()
 
 	results := runResolversInParallel(ctx, resolvers, targets)
-	return collectResults(ctx, results, targets), nil
+	return collectResults(ctx, results, targets, resolved), nil
 }
 
 func applyDefaults(opts Options) Options {
@@ -73,7 +76,9 @@ func applyDefaults(opts Options) Options {
 		opts.NetBIOSTimeout = DefaultNetBIOSTimeout
 	}
 	if opts.RDNSTimeout == 0 {
-		opts.RDNSTimeout = DefaultRDNSTimeout
+		// rDNS shares the global window; a separate 30 s cap would be silently
+		// unreachable whenever opts.Timeout < 30 s.
+		opts.RDNSTimeout = opts.Timeout
 	}
 	if opts.NTLMTimeout == 0 {
 		opts.NTLMTimeout = DefaultNTLMTimeout
@@ -81,27 +86,12 @@ func applyDefaults(opts Options) Options {
 	return opts
 }
 
-// needsMDNS reports whether any of the requested methods require mDNS.
-func needsMDNS(methods []Method) bool {
-	for _, m := range methods {
-		if m == MethodMDNS {
-			return true
-		}
-	}
-	return false
-}
-
-// buildResolvers instantiates the concrete [Resolver] for each requested method.
-// Interface resolution and multicast validation are only performed when mDNS is
-// in the method list.
-func buildResolvers(opts Options, targets []string) ([]Resolver, error) {
+func buildResolvers(opts Options, targets []string, resolved *proto.ResolvedSet) ([]Resolver, error) {
 	var resolvers []Resolver
 
-	// Resolve the network interface once, only when mDNS needs it.
 	var iface *net.Interface
 	var bindIP net.IP
-
-	if needsMDNS(opts.Methods) {
+	if needsMethod(opts.Methods, MethodMDNS) {
 		var err error
 		iface, bindIP, err = prepareInterface(opts.Interface, opts.CIDR)
 		if err != nil {
@@ -122,9 +112,10 @@ func buildResolvers(opts Options, targets []string) ([]Resolver, error) {
 				Timeout: opts.RDNSTimeout,
 			}))
 		case MethodNTLM:
+			delay := ntlmStartDelay(opts, len(targets))
 			resolvers = append(resolvers, ntlm.NewResolver(ntlm.Options{
 				Timeout: opts.NTLMTimeout,
-			}))
+			}, resolved, delay))
 		default:
 			logger.Infof("warning: unknown resolution method %q — skipping", m)
 		}
@@ -133,6 +124,32 @@ func buildResolvers(opts Options, targets []string) ([]Resolver, error) {
 		return nil, fmt.Errorf("no valid resolution methods specified")
 	}
 	return resolvers, nil
+}
+
+// ntlmStartDelay computes how long NTLM should wait before opening TCP
+// connections.  It estimates the NetBIOS wave-1 duration (using the same
+// pacing formula NetBIOS itself uses) and adds a 300 ms buffer, giving the
+// UDP resolvers a meaningful head start.  The delay is capped at 25 % of the
+// global scan budget so NTLM always gets a useful window.
+func ntlmStartDelay(opts Options, targetCount int) time.Duration {
+	wave1 := netbios.ComputePacing(opts.NetBIOSTimeout, targetCount) * time.Duration(targetCount)
+	delay := wave1 + 300*time.Millisecond
+	if delay < 500*time.Millisecond {
+		delay = 500 * time.Millisecond
+	}
+	if cap := time.Duration(float64(opts.Timeout) * 0.25); delay > cap {
+		delay = cap
+	}
+	return delay
+}
+
+func needsMethod(methods []Method, m Method) bool {
+	for _, x := range methods {
+		if x == m {
+			return true
+		}
+	}
+	return false
 }
 
 func prepareInterface(hint, cidr string) (*net.Interface, net.IP, error) {
@@ -152,9 +169,6 @@ func prepareInterface(hint, cidr string) (*net.Interface, net.IP, error) {
 	return iface, ip, nil
 }
 
-// runResolversInParallel launches each resolver in its own goroutine and
-// fans all output into a single merged channel that is closed when every
-// resolver has finished.
 func runResolversInParallel(ctx context.Context, resolvers []Resolver, targets []string) <-chan HostResult {
 	merged := make(chan HostResult, resultChBuffer)
 	var wg sync.WaitGroup
@@ -172,9 +186,10 @@ func runResolversInParallel(ctx context.Context, resolvers []Resolver, targets [
 	return merged
 }
 
-// collectResults drains the merged channel, deduplicates by IP, and returns
-// a slice sorted by IP once ctx is done or all targets are resolved.
-func collectResults(ctx context.Context, ch <-chan HostResult, targets []string) []HostResult {
+// collectResults drains the merged channel, deduplicates by IP, feeds each
+// new result into resolved (so live resolvers can skip it), and returns a
+// slice sorted by IP once ctx is done or all targets are resolved.
+func collectResults(ctx context.Context, ch <-chan HostResult, targets []string, resolved *proto.ResolvedSet) []HostResult {
 	targetSet := make(map[string]bool, len(targets))
 	for _, ip := range targets {
 		targetSet[ip] = true
@@ -191,6 +206,7 @@ loop:
 			if targetSet[r.IP] {
 				if _, already := seen[r.IP]; !already {
 					seen[r.IP] = r
+					resolved.Add(r.IP)
 					logger.Infof("found [%s]: %-18s  %s", r.Method, r.IP, r.Hostname)
 					if len(seen) == len(targets) {
 						logger.Infof("all %d targets resolved — stopping early", len(targets))

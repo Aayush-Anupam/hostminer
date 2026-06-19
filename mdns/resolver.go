@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -43,14 +42,17 @@ func (r *Resolver) Resolve(ctx context.Context, targets []string, results chan<-
 	}
 	defer d.Close()
 
-	pacing := computePTRPacing(r.timeout, r.targetCount)
 	phase2 := time.Duration(float64(r.timeout) * dnsSDPhase2Fraction)
-
-	logger.Infof("[mdns] PTR pacing %v for %d targets (send budget %v)",
-		pacing, r.targetCount, time.Duration(float64(r.timeout)*ptrSendBudget))
-
 	go runDNSSDSender(d, phase2)
-	go runPTRSender(ctx, d, targets, pacing)
+
+	if r.targetCount <= ptrMaxTargets {
+		pacing := computePTRPacing(r.timeout, r.targetCount)
+		logger.Infof("[mdns] PTR pacing %v for %d targets", pacing, r.targetCount)
+		go runPTRSender(ctx, d, targets, pacing)
+	} else {
+		logger.Infof("[mdns] PTR queries skipped for %d-host target (limit %d); DNS-SD continues",
+			r.targetCount, ptrMaxTargets)
+	}
 
 	for {
 		select {
@@ -79,39 +81,28 @@ func computePTRPacing(timeout time.Duration, targetCount int) time.Duration {
 	return pacing
 }
 
+// runPTRSender sends one reverse-PTR query per tick interval from a single
+// goroutine.  A worker pool provides no throughput benefit here because the
+// shared Dispatcher socket is the serialisation point; multiple goroutines
+// competing for the same ticker would only add scheduling overhead.
 func runPTRSender(ctx context.Context, d *Dispatcher, targets []string, pacing time.Duration) {
-	ipCh := make(chan string, len(targets))
-	for _, ip := range targets {
-		ipCh <- ip
-	}
-	close(ipCh)
-
 	ticker := time.NewTicker(pacing)
 	defer ticker.Stop()
 
-	var wg sync.WaitGroup
-	for i := 0; i < ptrWorkerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ip := range ipCh {
-				rev := buildReverseName(ip)
-				if rev == "" {
-					continue
-				}
-				select {
-				case <-ticker.C:
-					d.Send(rev, dns.TypePTR)
-				case <-d.done:
-					return
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
+	for _, ip := range targets {
+		rev := buildReverseName(ip)
+		if rev == "" {
+			continue
+		}
+		select {
+		case <-ticker.C:
+			d.Send(rev, dns.TypePTR)
+		case <-d.done:
+			return
+		case <-ctx.Done():
+			return
+		}
 	}
-
-	wg.Wait()
 	logger.Infof("[mdns] all PTR queries sent")
 }
 
